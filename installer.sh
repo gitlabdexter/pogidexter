@@ -5,22 +5,19 @@ set -euo pipefail
 #  Autoscript Installer + Services Auto-Setup
 #  - OpenSSH server
 #  - Dropbear SSH server
-#  - SSH over WebSocket (HTTP:80, SSL:443)
-#  - Squid Proxy (8080)
-#  - SlowDNS via iodine (iodined server)
-#  - V2Ray VLESS (Xray-core latest) with WS+TLS on :443 behind Nginx
-#  - Auto DNS setup using Cloudflare API (A/NS records)
-#  - Interactive menu for creating OpenSSH accounts (usable via WS/SlowDNS)
-#  - Auto account expiry management with cron cleanup
-#  - Interactive menu for creating/deleting/listing VLESS accounts with expiry
-#  - Auto-reload Xray when VLESS accounts change (including cron cleanup)
+#  - SSH over WebSocket (Python on :80)
+#  - Squid Proxy (:8080)
+#  - SlowDNS via iodine
+#  - V2Ray VLESS (Xray-core latest) with WS+TLS behind Nginx
+#  - Cloudflare Auto-DNS
+#  - Interactive menus for account management
 # =============================================
 
-# Force bash if executed with sh
-if [ -z "$BASH_VERSION" ]; then
+if [ -z "${BASH_VERSION:-}" ]; then
   exec /bin/bash "$0" "$@"
 fi
 
+# ---------- Helpers ----------
 log(){ echo -e "\e[1;32m[+]\e[0m $*"; }
 warn(){ echo -e "\e[1;33m[!]\e[0m $*"; }
 err(){ echo -e "\e[1;31m[-]\e[0m $*"; }
@@ -29,38 +26,39 @@ cmd_exists(){ command -v "$1" >/dev/null 2>&1; }
 
 need_root
 
-if [[ -f /etc/debian_version ]]; then
-  PM_UPDATE="apt-get update"
-  PM_INSTALL="apt-get install -y"
-else
-  err "This script currently supports Debian/Ubuntu only."; exit 1
-fi
-
-# ---------- Ports ----------
+# ---------- Defaults ----------
 SSH_HTTP_PORT=80
 SSH_SSL_PORT=443
 SSH_DROPBEAR_PORT=444
 SQUID_PORT=8080
 
-# ---------- VLESS defaults ----------
 VLESS_DOMAIN=${VLESS_DOMAIN:-}
 VLESS_WS_PATH=${VLESS_WS_PATH:-/vlessws}
 EMAIL_FOR_ACME=${EMAIL_FOR_ACME:-}
 
-# SlowDNS (iodine)
 SLOWDNS_DOMAIN=${SLOWDNS_DOMAIN:-}
 IODINE_PASSWORD=${IODINE_PASSWORD:-$(tr -dc A-Za-z0-9 </dev/urandom | head -c 16)}
 TUN_NET=${TUN_NET:-10.10.0.1}
 
-# Cloudflare API
 CF_API_TOKEN=${CF_API_TOKEN:-}
 CF_ZONE=${CF_ZONE:-}
 
-log "Installing dependencies..."
-$PM_UPDATE
-$PM_INSTALL curl wget unzip socat cron ca-certificates python3 python3-pip git coreutils net-tools openssh-server dropbear jq nginx certbot python3-certbot-nginx whiptail squid iodine dos2unix
+USERS_FILE=/etc/xray/vless_users.txt
 
-dos2unix "$0" 2>/dev/null || true
+# ---------- Functions ----------
+install_dependencies(){
+  log "Installing dependencies..."
+  if [[ -f /etc/debian_version ]]; then
+    apt-get update
+    apt-get install -y curl wget unzip socat cron ca-certificates python3 python3-pip git \
+      coreutils net-tools openssh-server dropbear jq nginx certbot python3-certbot-nginx \
+      whiptail squid iodine dos2unix
+    pip3 install websockets
+  else
+    err "This script currently supports Debian/Ubuntu only."
+    exit 1
+  fi
+}
 
 # ---------- Cloudflare Auto DNS ----------
 setup_cloudflare_dns(){
@@ -101,7 +99,7 @@ setup_cloudflare_dns(){
   fi
 }
 
-# ---------- Auto Configure Services ----------
+
 configure_services(){
   log "Configuring Dropbear on port $SSH_DROPBEAR_PORT"
   echo "/bin/false" >> /etc/shells || true
@@ -113,19 +111,69 @@ configure_services(){
   sed -i "s/^http_port.*/http_port $SQUID_PORT/" /etc/squid/squid.conf || echo "http_port $SQUID_PORT" >> /etc/squid/squid.conf
   systemctl enable squid --now
 
-  log "Configuring SSH over WebSocket"
+  log "Setting up SSH over WebSocket (Python) on port $SSH_HTTP_PORT"
+  cat >/usr/local/bin/sshws.py <<'EOF'
+#!/usr/bin/env python3
+import asyncio, websockets
+
+TARGET_HOST = "127.0.0.1"
+TARGET_PORT = 22
+LISTEN_PORT = 80
+
+async def handle_ws(ws, path):
+    reader, writer = await asyncio.open_connection(TARGET_HOST, TARGET_PORT)
+
+    async def ws_to_tcp():
+        try:
+            async for message in ws:
+                if isinstance(message, str):
+                    writer.write(message.encode())
+                else:
+                    writer.write(message)
+                await writer.drain()
+        except:
+            pass
+        finally:
+            writer.close()
+
+    async def tcp_to_ws():
+        try:
+            while not reader.at_eof():
+                data = await reader.read(1024)
+                if not data:
+                    break
+                await ws.send(data)
+        except:
+            pass
+        finally:
+            await ws.close()
+
+    await asyncio.gather(ws_to_tcp(), tcp_to_ws())
+
+async def main():
+    async with websockets.serve(handle_ws, "0.0.0.0", LISTEN_PORT, max_size=None, max_queue=None):
+        print(f"SSH WebSocket listening on port {LISTEN_PORT}")
+        await asyncio.Future()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+EOF
+
+  chmod +x /usr/local/bin/sshws.py
+
   cat >/etc/systemd/system/sshws.service <<EOF
 [Unit]
-Description=SSH over WebSocket
+Description=SSH over WebSocket (Python)
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/python3 -m websockets ws://0.0.0.0:$SSH_HTTP_PORT -- /usr/sbin/sshd -i
+ExecStart=/usr/bin/python3 /usr/local/bin/sshws.py
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
   systemctl daemon-reexec
   systemctl enable sshws --now
 
@@ -148,9 +196,11 @@ EOF
   "outbounds": [ { "protocol": "freedom" } ]
 }
 EOF
+
   curl -L https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o /tmp/xray.zip
   unzip -o /tmp/xray.zip -d /usr/local/bin/
   chmod +x /usr/local/bin/xray
+
   cat >/etc/systemd/system/xray.service <<EOF
 [Unit]
 Description=Xray Service
@@ -163,6 +213,7 @@ Restart=on-failure
 [Install]
 WantedBy=multi-user.target
 EOF
+
   systemctl daemon-reexec
   systemctl enable xray --now
 
@@ -255,6 +306,12 @@ main_menu(){
   done
 }
 
-setup_cloudflare_dns
-configure_services
-main_menu
+# ---------- Dispatcher ----------
+case "${1:-}" in
+  --install) install_dependencies; setup_cloudflare_dns; configure_services ;;
+  --dns) setup_cloudflare_dns ;;
+  --ssh) ssh_menu ;;
+  --vless) vless_menu ;;
+  --menu) main_menu ;;
+  *) echo "Usage: $0 [--install | --menu | --dns | --ssh | --vless]"; exit 0 ;;
+esac
