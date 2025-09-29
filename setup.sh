@@ -1,409 +1,321 @@
-#!/usr/bin/env bash
-# Quick Setup | Script Setup Manager (Debian 12 compatible)
-# Edition : Stable Edition 1.0 - adapted for Debian 12
-# Author  : givps (adapted)
-# License : MIT
+#!/bin/bash
 set -euo pipefail
 
-# Noninteractive APT
-export DEBIAN_FRONTEND=noninteractive
-export APT_LISTCHANGES_FRONTEND=none
+# =============================================
+#  Autoscript Installer + Services Auto-Setup
+#  - OpenSSH server
+#  - Dropbear SSH server
+#  - SSH over WebSocket (Python on :80)
+#  - Squid Proxy (:8080)
+#  - SlowDNS via iodine
+#  - V2Ray VLESS (Xray-core latest) with WS+TLS behind Nginx
+#  - Cloudflare Auto-DNS
+#  - Interactive menus for account management
+# =============================================
 
-log() { echo "$(date -Is) $*"; }
-
-log "Detecting public IP"
-if command -v curl >/dev/null 2>&1; then
-  MYIP=$(curl -fsSL ipv4.icanhazip.com || true)
-else
-  MYIP=$(wget -qO- ipv4.icanhazip.com || true)
-fi
-: "${MYIP:=127.0.0.1}"
-MYIP2="s/xxxxxxxxx/${MYIP}/g"
-
-NET=$(ip -o -4 route show to default | awk '{print $5}' | head -n1 || true)
-
-if [ -r /etc/os-release ]; then
-  source /etc/os-release
-  ver=${VERSION_ID:-}
-else
-  ver=""
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec /bin/bash "$0" "$@"
 fi
 
-log "Platform: ${PRETTY_NAME:-Unknown}; Version: ${ver:-unknown}; Interface: ${NET}; IP: ${MYIP}"
+# ---------- Helpers ----------
+log(){ echo -e "\e[1;32m[+]\e[0m $*"; }
+warn(){ echo -e "\e[1;33m[!]\e[0m $*"; }
+err(){ echo -e "\e[1;31m[-]\e[0m $*"; }
+need_root(){ if [[ $(id -u) -ne 0 ]]; then err "Please run as root"; exit 1; fi }
+cmd_exists(){ command -v "$1" >/dev/null 2>&1; }
 
-log "Updating apt cache and upgrading system"
-apt update -y
-apt -y full-upgrade
+need_root
 
-log "Removing ufw firewalld and exim4 if present"
-apt-get remove --purge -y ufw firewalld exim4 || true
+# ---------- Defaults ----------
+SSH_HTTP_PORT=80
+SSH_SSL_PORT=443
+SSH_DROPBEAR_PORT=444
+SQUID_PORT=8080
 
-log "Installing required packages"
-apt-get update -y
-apt-get install -y --no-install-recommends netfilter-persistent screen curl jq bzip2 gzip vnstat coreutils rsyslog iftop zip unzip git apt-transport-https build-essential wget openssl ca-certificates figlet ruby python3 python3-venv python3-pip make cmake rsyslog net-tools nano sed gnupg bc jq dirmngr libxml-parser-perl neofetch lsof libsqlite3-dev zlib1g-dev libssl-dev dos2unix gcc g++ libreadline-dev perl
+VLESS_DOMAIN=${VLESS_DOMAIN:-}
+VLESS_WS_PATH=${VLESS_WS_PATH:-/vlessws}
+EMAIL_FOR_ACME=${EMAIL_FOR_ACME:-}
 
-if ! command -v shc >/dev/null 2>&1; then
-  log "Installing shc"
-  apt-get install -y shc || log "shc not available via apt skip"
-fi
+SLOWDNS_DOMAIN=${SLOWDNS_DOMAIN:-}
+IODINE_PASSWORD=${IODINE_PASSWORD:-$(tr -dc A-Za-z0-9 </dev/urandom | head -c 16)}
+TUN_NET=${TUN_NET:-10.10.0.1}
 
-if command -v gem >/dev/null 2>&1; then
-  log "Installing lolcat gem"
-  gem install lolcat || log "gem install lolcat failed continue"
-fi
+CF_API_TOKEN=${CF_API_TOKEN:-}
+CF_ZONE=${CF_ZONE:-}
 
-if [ -z "${NET}" ]; then
-  NET=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)
-fi
+USERS_FILE=/etc/xray/vless_users.txt
 
-PAM_BACKUP=/etc/pam.d/common-password.bak-$(date +%s)
-if [ -f /etc/pam.d/common-password ]; then
-  log "Backing up existing /etc/pam.d/common-password to ${PAM_BACKUP}"
-  cp -a /etc/pam.d/common-password "${PAM_BACKUP}"
-fi
+# ---------- Functions ----------
+install_dependencies(){
+  log "Installing dependencies..."
+  if [[ -f /etc/debian_version ]]; then
+    apt-get update
+    apt-get install -y curl wget unzip socat cron ca-certificates python3 python3-pip git \
+      coreutils net-tools openssh-server dropbear jq nginx certbot python3-certbot-nginx \
+      whiptail squid iodine dos2unix
+    pip3 install websockets
+  else
+    err "This script currently supports Debian/Ubuntu only."
+    exit 1
+  fi
+}
 
-: '
-echo "Retrieving encrypted PAM file and decrypting (UNCOMMENT to enable)..."
-curl -sS https://raw.githubusercontent.com/gitlabdexter/pogidexter/refs/heads/server_script/ssh/password | openssl aes-256-cbc -d -a -pass pass:scvps07gg -pbkdf2 > /etc/pam.d/common-password
-chmod 644 /etc/pam.d/common-password
-'
+# ---------- Cloudflare Auto DNS ----------
+setup_cloudflare_dns(){
+  if [[ -z "$CF_API_TOKEN" || -z "$VLESS_DOMAIN" || -z "$CF_ZONE" ]]; then
+    warn "Cloudflare credentials not provided; skipping auto DNS."
+    return 0
+  fi
+  log "Setting A record for $VLESS_DOMAIN via Cloudflare API"
+  IP=$(curl -s ipv4.icanhazip.com)
+  REC_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${CF_ZONE}/dns_records?type=A&name=${VLESS_DOMAIN}" \
+    -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" | jq -r '.result[0].id')
+  if [[ "$REC_ID" == "null" || -z "$REC_ID" ]]; then
+    curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE}/dns_records" \
+      -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" \
+      --data '{"type":"A","name":"'${VLESS_DOMAIN}'","content":"'${IP}'","ttl":120,"proxied":false}' >/dev/null
+  else
+    curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/${CF_ZONE}/dns_records/${REC_ID}" \
+      -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" \
+      --data '{"type":"A","name":"'${VLESS_DOMAIN}'","content":"'${IP}'","ttl":120,"proxied":false}' >/dev/null
+  fi
+  log "A record updated for $VLESS_DOMAIN -> $IP"
 
-log "Installing rc.local shim"
-cat > /etc/systemd/system/rc-local.service <<'EOF'
+  # NS record for SlowDNS subdomain
+  if [[ -n "$SLOWDNS_DOMAIN" ]]; then
+    log "Setting NS record for SlowDNS domain $SLOWDNS_DOMAIN"
+    NS_REC_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${CF_ZONE}/dns_records?type=NS&name=${SLOWDNS_DOMAIN}" \
+      -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" | jq -r '.result[0].id')
+    if [[ "$NS_REC_ID" == "null" || -z "$NS_REC_ID" ]]; then
+      curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE}/dns_records" \
+        -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" \
+        --data '{"type":"NS","name":"'${SLOWDNS_DOMAIN}'","content":"'${VLESS_DOMAIN}'","ttl":120}' >/dev/null
+    else
+      curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/${CF_ZONE}/dns_records/${NS_REC_ID}" \
+        -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" \
+        --data '{"type":"NS","name":"'${SLOWDNS_DOMAIN}'","content":"'${VLESS_DOMAIN}'","ttl":120}' >/dev/null
+    fi
+    log "NS record updated for $SLOWDNS_DOMAIN -> $VLESS_DOMAIN"
+  fi
+}
+
+
+configure_services(){
+  log "Configuring Dropbear on port $SSH_DROPBEAR_PORT"
+  echo "/bin/false" >> /etc/shells || true
+  sed -i "s/^NO_START=.*/NO_START=0/" /etc/default/dropbear
+  sed -i "s/^DROPBEAR_PORT=.*/DROPBEAR_PORT=$SSH_DROPBEAR_PORT/" /etc/default/dropbear
+  systemctl enable dropbear --now
+
+  log "Configuring Squid on port $SQUID_PORT"
+  sed -i "s/^http_port.*/http_port $SQUID_PORT/" /etc/squid/squid.conf || echo "http_port $SQUID_PORT" >> /etc/squid/squid.conf
+  systemctl enable squid --now
+
+  log "Setting up SSH over WebSocket (Python) on port $SSH_HTTP_PORT"
+  cat >/usr/local/bin/sshws.py <<'EOF'
+#!/usr/bin/env python3
+import asyncio, websockets
+
+TARGET_HOST = "127.0.0.1"
+TARGET_PORT = 22
+LISTEN_PORT = 80
+
+async def handle_ws(ws, path):
+    reader, writer = await asyncio.open_connection(TARGET_HOST, TARGET_PORT)
+
+    async def ws_to_tcp():
+        try:
+            async for message in ws:
+                if isinstance(message, str):
+                    writer.write(message.encode())
+                else:
+                    writer.write(message)
+                await writer.drain()
+        except:
+            pass
+        finally:
+            writer.close()
+
+    async def tcp_to_ws():
+        try:
+            while not reader.at_eof():
+                data = await reader.read(1024)
+                if not data:
+                    break
+                await ws.send(data)
+        except:
+            pass
+        finally:
+            await ws.close()
+
+    await asyncio.gather(ws_to_tcp(), tcp_to_ws())
+
+async def main():
+    async with websockets.serve(handle_ws, "0.0.0.0", LISTEN_PORT, max_size=None, max_queue=None):
+        print(f"SSH WebSocket listening on port {LISTEN_PORT}")
+        await asyncio.Future()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+EOF
+
+  chmod +x /usr/local/bin/sshws.py
+
+  cat >/etc/systemd/system/sshws.service <<EOF
 [Unit]
-Description=/etc/rc.local
-ConditionPathExists=/etc/rc.local
+Description=SSH over WebSocket (Python)
+After=network.target
+
 [Service]
-Type=forking
-ExecStart=/etc/rc.local start
-TimeoutSec=0
-StandardOutput=tty
-RemainAfterExit=yes
-SysVStartPriority=99
+ExecStart=/usr/bin/python3 /usr/local/bin/sshws.py
+Restart=always
+
 [Install]
 WantedBy=multi-user.target
 EOF
 
-cat > /etc/rc.local <<'EOF'
-#!/bin/sh -e
-exit 0
+  systemctl daemon-reexec
+  systemctl enable sshws --now
+
+  log "Configuring Xray VLESS on $VLESS_DOMAIN"
+  mkdir -p /etc/xray
+  cat >/etc/xray/config.json <<EOF
+{
+  "inbounds": [
+    {
+      "port": 443,
+      "protocol": "vless",
+      "settings": { "clients": [] },
+      "streamSettings": {
+        "network": "ws",
+        "security": "tls",
+        "wsSettings": { "path": "$VLESS_WS_PATH" }
+      }
+    }
+  ],
+  "outbounds": [ { "protocol": "freedom" } ]
+}
 EOF
 
-chmod +x /etc/rc.local
-systemctl daemon-reload
-systemctl enable --now rc-local.service || true
+  curl -L https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o /tmp/xray.zip
+  unzip -o /tmp/xray.zip -d /usr/local/bin/
+  chmod +x /usr/local/bin/xray
 
-log "Disabling IPv6 persistently"
-cat > /etc/sysctl.d/99-disable-ipv6.conf <<'EOF'
-# Disable IPv6
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
+  cat >/etc/systemd/system/xray.service <<EOF
+[Unit]
+Description=Xray Service
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/xray run -c /etc/xray/config.json
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
 EOF
-sysctl --system || true
 
-log "Housekeeping apt"
-apt-get -y autoremove
-apt-get -y clean
+  systemctl daemon-reexec
+  systemctl enable xray --now
 
-log "Set timezone to Asia/Jakarta"
-ln -fs /usr/share/zoneinfo/Asia/Jakarta /etc/localtime
-
-log "Comment AcceptEnv lines in sshd_config"
-sed -i 's/AcceptEnv/#AcceptEnv/g' /etc/ssh/sshd_config || true
-
-install_ssl(){
-    if [ -f "/usr/bin/apt-get" ];then
-            isDebian=$(cat /etc/issue | grep Debian || true)
-            apt-get install -y nginx certbot || true
-            apt install -y nginx certbot || true
-            sleep 3
-    else
-            yum install -y nginx certbot || true
-            sleep 3
-    fi
-
-    systemctl stop nginx.service || true
-
-    if [ -f "/usr/bin/apt-get" ];then
-            isDebian=$(cat /etc/issue | grep Debian || true)
-            echo "A" | certbot certonly --renew-by-default --register-unsafely-without-email --standalone -d $domain || true
-            sleep 3
-    else
-        echo "Y" | certbot certonly --renew-by-default --register-unsafely-without-email --standalone -d $domain || true
-        sleep 3
-    fi
+  log "Configuring SlowDNS (iodined)"
+  systemctl enable iodined --now || true
 }
 
-log "Installing nginx and web files"
-apt -y install nginx
-cd
-rm -f /etc/nginx/sites-enabled/default
-rm -f /etc/nginx/sites-available/default
-wget -O /etc/nginx/nginx.conf "https://raw.githubusercontent.com/gitlabdexter/pogidexter/refs/heads/server_script/ssh/nginx.conf"
-rm -f /etc/nginx/conf.d/vps.conf
-wget -O /etc/nginx/conf.d/vps.conf "https://raw.githubusercontent.com/gitlabdexter/pogidexter/refs/heads/server_script/ssh/vps.conf"
-systemctl restart nginx || true
+# ========== SSH Account Menu ==========
+ssh_menu(){
+  while true; do
+    CHOICE=$(whiptail --title "SSH Account Manager" --menu "Choose an option" 20 60 10 \
+      "1" "Create SSH Account" \
+      "2" "List SSH Accounts" \
+      "3" "Delete SSH Account" \
+      "4" "Back" 3>&1 1>&2 2>&3)
+    case $CHOICE in
+      1)
+        USER=$(whiptail --inputbox "Enter username:" 10 40 3>&1 1>&2 2>&3)
+        DAYS=$(whiptail --inputbox "Valid for how many days?" 10 40 3>&1 1>&2 2>&3)
+        useradd -e $(date -d "+$DAYS days" +%Y-%m-%d) -M -s /bin/false "$USER"
+        PASS=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 8)
+        echo "$USER:$PASS" | chpasswd
+        whiptail --msgbox "Created SSH user $USER with password $PASS (expires in $DAYS days)." 10 60
+        ;;
+      2)
+        cut -d: -f1,8 /etc/shadow | grep -v '!*' | column -t | whiptail --textbox - 20 60
+        ;;
+      3)
+        USER=$(whiptail --inputbox "Enter username to delete:" 10 40 3>&1 1>&2 2>&3)
+        userdel -r "$USER"
+        whiptail --msgbox "Deleted SSH user $USER" 10 40
+        ;;
+      4)
+        break
+        ;;
+    esac
+  done
+}
 
-mkdir -p /etc/systemd/system/nginx.service.d
-cat > /etc/systemd/system/nginx.service.d/override.conf <<'EOF'
-[Service]
-ExecStartPost=/bin/sleep 0.1
-EOF
-rm -f /etc/nginx/conf.d/default.conf
-systemctl daemon-reload
-systemctl restart nginx || true
-cd
-mkdir -p /home/vps/public_html
-wget -O /home/vps/public_html/index.html "https://raw.githubusercontent.com/gitlabdexter/pogidexter/refs/heads/server_script/ssh/index"
-mkdir -p /home/vps/public_html/ss-ws
-mkdir -p /home/vps/public_html/clash-ws
+# ========== VLESS Account Menu ==========
+vless_menu(){
+  mkdir -p /etc/xray
+  USERS_FILE=/etc/xray/vless_users.txt
+  touch "$USERS_FILE"
+  while true; do
+    CHOICE=$(whiptail --title "VLESS Account Manager" --menu "Choose an option" 20 60 10 \
+      "1" "Create VLESS Account" \
+      "2" "List VLESS Accounts" \
+      "3" "Delete VLESS Account" \
+      "4" "Back" 3>&1 1>&2 2>&3)
+    case $CHOICE in
+      1)
+        USER=$(whiptail --inputbox "Enter VLESS username:" 10 40 3>&1 1>&2 2>&3)
+        DAYS=$(whiptail --inputbox "Valid for how many days?" 10 40 3>&1 1>&2 2>&3)
+        UUID=$(cat /proc/sys/kernel/random/uuid)
+        EXP=$(date -d "+$DAYS days" +%Y-%m-%d)
+        echo "$USER|$UUID|$EXP" >> "$USERS_FILE"
+        systemctl reload xray
+        URL="vless://${UUID}@${VLESS_DOMAIN}:443?encryption=none&security=tls&type=ws&path=${VLESS_WS_PATH}#${USER}"
+        whiptail --msgbox "Created VLESS user $USER (expires $EXP)\nConfig: $URL" 12 70
+        ;;
+      2)
+        whiptail --textbox "$USERS_FILE" 20 60
+        ;;
+      3)
+        USER=$(whiptail --inputbox "Enter VLESS username to delete:" 10 40 3>&1 1>&2 2>&3)
+        sed -i "/^$USER|/d" "$USERS_FILE"
+        systemctl reload xray
+        whiptail --msgbox "Deleted VLESS user $USER" 10 40
+        ;;
+      4)
+        break
+        ;;
+    esac
+  done
+}
 
- wget --no-check-certificate -O /etc/init.d/squid https://gitlab.com/dextereskalarte/Mtk-dev/-/raw/main/squid.sh
-    chmod +x /etc/init.d/squid
-    update-rc.d squid defaults
-    chown -cR proxy /var/log/squid
-    squid -z
-    cd /etc/squid/
-    rm squid.conf
-    echo "acl Firenet dst `curl -s https://api.ipify.org`" >> squid.conf
-    echo 'http_port 8080
-http_port 8181
-visible_hostname Proxy
-acl PURGE method PURGE
-acl HEAD method HEAD
-acl POST method POST
-acl GET method GET
-acl CONNECT method CONNECT
-http_access allow Firenet
-http_reply_access allow all
-http_access deny all
-icp_access allow all
-always_direct allow all
-visible_hostname Dexter-Proxy
-error_directory /usr/share/squid/errors/English' >> squid.conf
-    cd /usr/share/squid/errors/English
-    rm ERR_INVALID_URL
-    echo '<!--MtkDev--><!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>SECURE PROXY</title><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="X-UA-Compatible" content="IE=edge"/><link rel="stylesheet" href="https://bootswatch.com/4/slate/bootstrap.min.css" media="screen"><link href="https://fonts.googleapis.com/css?family=Press+Start+2P" rel="stylesheet"><style>body{font-family: "Press Start 2P", cursive;}.fn-color{color: #ffff; background-image: -webkit-linear-gradient(92deg, #f35626, #feab3a); -webkit-background-clip: text; -webkit-text-fill-color: transparent; -webkit-animation: hue 5s infinite linear;}@-webkit-keyframes hue{from{-webkit-filter: hue-rotate(0deg);}to{-webkit-filter: hue-rotate(-360deg);}}</style></head><body><div class="container" style="padding-top: 50px"><div class="jumbotron"><h1 class="display-3 text-center fn-color">SECURE PROXY</h1><h4 class="text-center text-danger">SERVER</h4><p class="text-center">😍 %w 😍</p></div></div></body></html>' >> ERR_INVALID_URL
-    chmod 755 *
-    /etc/init.d/squid start
-cd /etc || exit
-rm /etc/apt/sources.list
-sudo cp /etc/apt/sources.list_backup /etc/apt/sources.list
+# ========== Main Menu ==========
+main_menu(){
+  while true; do
+    CHOICE=$(whiptail --title "Autoscript Manager" --menu "Choose an option" 20 60 12 \
+      "1" "Manage SSH Accounts" \
+      "2" "Manage VLESS Accounts" \
+      "3" "Exit" 3>&1 1>&2 2>&3)
+    case $CHOICE in
+      1) ssh_menu ;;
+      2) vless_menu ;;
+      3) exit 0 ;;
+    esac
+  done
+}
 
-log "Installing badvpn binary"
-cd
-wget -O /usr/bin/badvpn-udpgw "https://raw.githubusercontent.com/gitlabdexter/pogidexter/refs/heads/server_script/ssh/newudpgw"
-chmod +x /usr/bin/badvpn-udpgw
-
-echo "screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7100 --max-clients 500" >> /etc/rc.local
-echo "screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7200 --max-clients 500" >> /etc/rc.local
-echo "screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 500" >> /etc/rc.local
-echo "screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7400 --max-clients 500" >> /etc/rc.local
-echo "screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7500 --max-clients 500" >> /etc/rc.local
-echo "screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7600 --max-clients 500" >> /etc/rc.local
-echo "screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7700 --max-clients 500" >> /etc/rc.local
-echo "screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7800 --max-clients 500" >> /etc/rc.local
-echo "screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7900 --max-clients 500" >> /etc/rc.local
-
-screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7100 --max-clients 500
-screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7200 --max-clients 500
-screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 500
-screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7400 --max-clients 500
-screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7500 --max-clients 500
-screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7600 --max-clients 500
-screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7700 --max-clients 500
-screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7800 --max-clients 500
-screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7900 --max-clients 500
-
-log "Configuring SSH ports"
-cd
-sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config
-grep -q "^Port 500$" /etc/ssh/sshd_config || echo "Port 500" >> /etc/ssh/sshd_config
-grep -q "^Port 40000$" /etc/ssh/sshd_config || echo "Port 40000" >> /etc/ssh/sshd_config
-grep -q "^Port 81$" /etc/ssh/sshd_config || echo "Port 81" >> /etc/ssh/sshd_config
-grep -q "^Port 51443$" /etc/ssh/sshd_config || echo "Port 51443" >> /etc/ssh/sshd_config
-grep -q "^Port 58080$" /etc/ssh/sshd_config || echo "Port 58080" >> /etc/ssh/sshd_config
-grep -q "^Port 666$" /etc/ssh/sshd_config || echo "Port 666" >> /etc/ssh/sshd_config
-grep -q "^Port 200$" /etc/ssh/sshd_config || echo "Port 200" >> /etc/ssh/sshd_config
-grep -q "^Port 22$" /etc/ssh/sshd_config || echo "Port 22" >> /etc/ssh/sshd_config
-grep -q "^Port 2222$" /etc/ssh/sshd_config || echo "Port 2222" >> /etc/ssh/sshd_config
-grep -q "^Port 2269$" /etc/ssh/sshd_config || echo "Port 2269" >> /etc/ssh/sshd_config
-systemctl restart ssh || true
-
-log "Install and configure Dropbear"
-apt -y install dropbear
-sed -i 's/NO_START=1/NO_START=0/g' /etc/default/dropbear || true
-sed -i 's/DROPBEAR_PORT=22/DROPBEAR_PORT=143/g' /etc/default/dropbear || true
-sed -i 's/DROPBEAR_EXTRA_ARGS=/DROPBEAR_EXTRA_ARGS="-p 50000 -p 109 -p 110 -p 69"/g' /etc/default/dropbear || true
-grep -q "/bin/false" /etc/shells || echo "/bin/false" >> /etc/shells
-grep -q "/usr/sbin/nologin" /etc/shells || echo "/usr/sbin/nologin" >> /etc/shells
-systemctl restart ssh || true
-systemctl restart dropbear || true
-
-cd
-log "Install stunnel"
-apt install -y stunnel4
-cat > /etc/stunnel/stunnel.conf <<'EOF'
-cert = /etc/stunnel/stunnel.pem
-client = no
-socket = a:SO_REUSEADDR=1
-socket = l:TCP_NODELAY=1
-socket = r:TCP_NODELAY=1
-
-[dropbear]
-accept = 222
-connect = 127.0.0.1:22
-
-[dropbear]
-accept = 777
-connect = 127.0.0.1:109
-
-[ws-stunnel]
-accept = 2096
-connect = 700
-
-EOF
-
-log "Generate stunnel certificate"
-openssl genrsa -out key.pem 2048
-openssl req -new -x509 -key key.pem -out cert.pem -days 1095 -subj "/C=$country/ST=$state/L=$locality/O=$organization/OU=$organizationalunit/CN=$commonname/emailAddress=$email"
-cat key.pem cert.pem >> /etc/stunnel/stunnel.pem
-
-sed -i 's/ENABLED=0/ENABLED=1/g' /etc/default/stunnel4 || true
-systemctl enable --now stunnel4 || true
-systemctl restart stunnel4 || true
-
-log "Install fail2ban"
-apt -y install fail2ban
-
-log "Installing DOS-Deflate if not present"
-if [ -d '/usr/local/ddos' ]; then
-  echo "Please un-install the previous version first"
-else
-  mkdir -p /usr/local/ddos
-  wget -q -O /usr/local/ddos/ddos.conf http://www.inetbase.com/scripts/ddos/ddos.conf || true
-  wget -q -O /usr/local/ddos/LICENSE http://www.inetbase.com/scripts/ddos/LICENSE || true
-  wget -q -O /usr/local/ddos/ignore.ip.list http://www.inetbase.com/scripts/ddos/ignore.ip.list || true
-  wget -q -O /usr/local/ddos/ddos.sh http://www.inetbase.com/scripts/ddos/ddos.sh || true
-  chmod 0755 /usr/local/ddos/ddos.sh || true
-  cp -s /usr/local/ddos/ddos.sh /usr/local/sbin/ddos || true
-  /usr/local/ddos/ddos.sh --cron > /dev/null 2>&1 || true
-fi
-
-log "Download banner and set"
-wget -O /etc/issue.net "https://raw.githubusercontent.com/gitlabdexter/pogidexter/refs/heads/server_script/ssh/banner.conf"
-grep -q "Banner /etc/issue.net" /etc/ssh/sshd_config || echo "Banner /etc/issue.net" >> /etc/ssh/sshd_config
-sed -i 's@DROPBEAR_BANNER=""@DROPBEAR_BANNER="/etc/issue.net"@g' /etc/default/dropbear || true
-
-log "Blocking torrent strings using iptables compatibility"
-iptables -A FORWARD -m string --string "get_peers" --algo bm -j DROP || true
-iptables -A FORWARD -m string --string "announce_peer" --algo bm -j DROP || true
-iptables -A FORWARD -m string --string "find_node" --algo bm -j DROP || true
-iptables -A FORWARD -m string --algo bm --string "BitTorrent" -j DROP || true
-iptables -A FORWARD -m string --algo bm --string "BitTorrent protocol" -j DROP || true
-iptables -A FORWARD -m string --algo bm --string "peer_id=" -j DROP || true
-iptables -A FORWARD -m string --algo bm --string ".torrent" -j DROP || true
-iptables -A FORWARD -m string --algo bm --string "announce.php?passkey=" -j DROP || true
-iptables -A FORWARD -m string --algo bm --string "torrent" -j DROP || true
-iptables -A FORWARD -m string --algo bm --string "announce" -j DROP || true
-iptables -A FORWARD -m string --algo bm --string "info_hash" -j DROP || true
-iptables-save > /etc/iptables.up.rules || true
-iptables-restore -t < /etc/iptables.up.rules || true
-netfilter-persistent save || true
-netfilter-persistent reload || true
-
-
-cat > /etc/cron.d/re_otm <<'CRON'
-SHELL=/bin/sh
-PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
-0 2 * * * root /sbin/reboot
-CRON
-
-cat > /etc/cron.d/xp_otm <<'CRON'
-SHELL=/bin/sh
-PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
-0 0 * * * root /usr/bin/xp
-CRON
-
-echo "7" > /home/re_otm
-
-systemctl restart cron || true
-
-sleep 1
-echo "Clearing trash"
-apt autoclean -y >/dev/null 2>&1 || true
-
-if dpkg -s unscd >/dev/null 2>&1; then
-  apt -y remove --purge unscd >/dev/null 2>&1 || true
-fi
-
-apt-get -y --purge remove samba* >/dev/null 2>&1 || true
-apt-get -y --purge remove apache2* >/dev/null 2>&1 || true
-apt-get -y --purge remove bind9* >/dev/null 2>&1 || true
-apt-get -y remove sendmail* >/dev/null 2>&1 || true
-apt autoremove -y >/dev/null 2>&1 || true
-
-cd
-chown -R www-data:www-data /home/vps/public_html || true
-
-echo "Restarting services"
-systemctl restart nginx || true
-systemctl restart cron || true
-systemctl restart ssh || true
-systemctl restart dropbear || true
-systemctl restart fail2ban || true
-systemctl restart stunnel4 || true
-systemctl restart vnstat || true
-
-
-screen -dmS badvpn1 badvpn-udpgw --listen-addr 127.0.0.1:7100 --max-clients 500 || true
-screen -dmS badvpn2 badvpn-udpgw --listen-addr 127.0.0.1:7200 --max-clients 500 || true
-screen -dmS badvpn3 badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 500 || true
-screen -dmS badvpn4 badvpn-udpgw --listen-addr 127.0.0.1:7400 --max-clients 500 || true
-screen -dmS badvpn5 badvpn-udpgw --listen-addr 127.0.0.1:7500 --max-clients 500 || true
-screen -dmS badvpn6 badvpn-udpgw --listen-addr 127.0.0.1:7600 --max-clients 500 || true
-screen -dmS badvpn7 badvpn-udpgw --listen-addr 127.0.0.1:7700 --max-clients 500 || true
-screen -dmS badvpn8 badvpn-udpgw --listen-addr 127.0.0.1:7800 --max-clients 500 || true
-screen -dmS badvpn9 badvpn-udpgw --listen-addr 127.0.0.1:7900 --max-clients 500 || true
-
-clear
-cd
-
-#Install Script Websocket-SSH Python
-wget -O /usr/local/bin/ws-dropbear https://raw.githubusercontent.com/gitlabdexter/pogidexter/refs/heads/server_script/ssh/ws-dropbear
-wget -O /usr/local/bin/ws-stunnel https://raw.githubusercontent.com/gitlabdexter/pogidexter/refs/heads/server_script/ssh/ws-stunnel
-
-#izin permision
-chmod +x /usr/local/bin/ws-dropbear
-chmod +x /usr/local/bin/ws-stunnel
-
-#System Dropbear Websocket-SSH Python
-wget -O /etc/systemd/system/ws-dropbear.service https://raw.githubusercontent.com/gitlabdexter/pogidexter/refs/heads/server_script/ssh/ws-dropbear.service && chmod +x /etc/systemd/system/ws-dropbear.service
-
-#System SSL/TLS Websocket-SSH Python
-wget -O /etc/systemd/system/ws-stunnel.service https://raw.githubusercontent.com/gitlabdexter/pogidexter/refs/heads/server_script/ssh/ws-stunnel.service && chmod +x /etc/systemd/system/ws-stunnel.service
-
-
-#restart service
-systemctl daemon-reload
-
-#Enable & Start & Restart ws-dropbear service
-systemctl enable ws-dropbear.service
-systemctl start ws-dropbear.service
-systemctl restart ws-dropbear.service
-
-#Enable & Start & Restart ws-openssh service
-systemctl enable ws-stunnel.service
-systemctl start ws-stunnel.service
-systemctl restart ws-stunnel.service
-
-history -c
-echo "unset HISTFILE" >> /etc/profile
-
-rm -f /root/key.pem || true
-rm -f /root/cert.pem || true
-rm -f /root/ssh-vpn.sh || true
-rm -f /root/bbr.sh || true
-
-clear
-log "Script finished"
+case "${1:-}" in
+  --install)
+    setup_cloudflare_dns
+    configure_services
+    main_menu
+    ;;
+  --menu)
+    main_menu
+    ;;
+  *)
+    echo "Usage: $0 [--install | --menu]"
+    ;;
+esac
