@@ -158,6 +158,38 @@ wget -O /home/vps/public_html/index.html "https://raw.githubusercontent.com/gitl
 mkdir -p /home/vps/public_html/ss-ws
 mkdir -p /home/vps/public_html/clash-ws
 
+ wget --no-check-certificate -O /etc/init.d/squid https://gitlab.com/dextereskalarte/Mtk-dev/-/raw/main/squid.sh
+    chmod +x /etc/init.d/squid
+    update-rc.d squid defaults
+    chown -cR proxy /var/log/squid
+    squid -z
+    cd /etc/squid/
+    rm squid.conf
+    echo "acl Firenet dst `curl -s https://api.ipify.org`" >> squid.conf
+    echo 'http_port 8080
+http_port 8181
+visible_hostname Proxy
+acl PURGE method PURGE
+acl HEAD method HEAD
+acl POST method POST
+acl GET method GET
+acl CONNECT method CONNECT
+http_access allow Firenet
+http_reply_access allow all
+http_access deny all
+icp_access allow all
+always_direct allow all
+visible_hostname Dexter-Proxy
+error_directory /usr/share/squid/errors/English' >> squid.conf
+    cd /usr/share/squid/errors/English
+    rm ERR_INVALID_URL
+    echo '<!--MtkDev--><!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>SECURE PROXY</title><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="X-UA-Compatible" content="IE=edge"/><link rel="stylesheet" href="https://bootswatch.com/4/slate/bootstrap.min.css" media="screen"><link href="https://fonts.googleapis.com/css?family=Press+Start+2P" rel="stylesheet"><style>body{font-family: "Press Start 2P", cursive;}.fn-color{color: #ffff; background-image: -webkit-linear-gradient(92deg, #f35626, #feab3a); -webkit-background-clip: text; -webkit-text-fill-color: transparent; -webkit-animation: hue 5s infinite linear;}@-webkit-keyframes hue{from{-webkit-filter: hue-rotate(0deg);}to{-webkit-filter: hue-rotate(-360deg);}}</style></head><body><div class="container" style="padding-top: 50px"><div class="jumbotron"><h1 class="display-3 text-center fn-color">SECURE PROXY</h1><h4 class="text-center text-danger">SERVER</h4><p class="text-center">😍 %w 😍</p></div></div></body></html>' >> ERR_INVALID_URL
+    chmod 755 *
+    /etc/init.d/squid start
+cd /etc || exit
+rm /etc/apt/sources.list
+sudo cp /etc/apt/sources.list_backup /etc/apt/sources.list
+
 log "Installing badvpn binary"
 cd
 wget -O /usr/bin/badvpn-udpgw "https://raw.githubusercontent.com/gitlabdexter/pogidexter/refs/heads/server_script/ssh/newudpgw"
@@ -316,14 +348,13 @@ chown -R www-data:www-data /home/vps/public_html || true
 
 echo "Restarting services"
 systemctl restart nginx || true
-systemctl restart openvpn || true
 systemctl restart cron || true
 systemctl restart ssh || true
 systemctl restart dropbear || true
 systemctl restart fail2ban || true
 systemctl restart stunnel4 || true
 systemctl restart vnstat || true
-systemctl restart squid || true
+
 
 screen -dmS badvpn1 badvpn-udpgw --listen-addr 127.0.0.1:7100 --max-clients 500 || true
 screen -dmS badvpn2 badvpn-udpgw --listen-addr 127.0.0.1:7200 --max-clients 500 || true
